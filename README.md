@@ -1,4 +1,4 @@
-# HAProxy 双模式通用组件（纯 IPv4：SNI/DNS 解锁 + TPROXY/REDIRECT 透明 TCP 截断）
+# HAProxy IPv4 双模式通用组件（SNI/DNS 解锁 + TPROXY/REDIRECT 透明 TCP 截断）
 
 同一个镜像内置两组纯 IPv4 生产配置，通过环境变量 **`TPROXY`** 一键切换：
 1. **模式 A（默认不传 `TPROXY` 或设为 `0`）**：**SNI / Host 动态分流 + 单实例 Dnsmasq 解锁模式**（加载 `haproxy.cfg` + `haproxy.map` + `dnsmasq.conf`，全程与宿主机 DNS 物理隔离）。
