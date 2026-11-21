@@ -24,9 +24,29 @@ if [ -n "${TZ}" ] && [ -e "/usr/share/zoneinfo/${TZ}" ]; then
   cp -rf "/usr/share/zoneinfo/${TZ}" /etc/localtime
 fi
 
-# 3. 识别运行模式开关（纯 IPv4 架构）
+# 3. 识别全局参数 LOWAT 与运行模式开关（纯 IPv4 架构）
+#    LOWAT 默认 131072（128KB），设为 0 则保持注释不启用 TCP_NOTSENT_LOWAT；
 #    TPROXY 默认留空（或 0）为 SNI/Host 分流 + DNS 解锁模式；
 #    设置 TPROXY=1 / <网卡或网段> / [SOURCE],[BIND:]PORT[,INPUT[,FWMARK]] 进入全端口透明 TCP 截断模式
+lowat_raw=$(printf '%s' "${LOWAT:-131072}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+case "${lowat_raw}" in
+  0|0k|0kb|0m|0mb|off|false|no|none) lowat="0" ;;
+  *[0-9]k|*[0-9]kb)
+    lowat_num="${lowat_raw%b}"; lowat_num="${lowat_num%k}"
+    case "${lowat_num}" in *[!0-9]*|"") lowat="" ;; *) lowat=$((lowat_num * 1024)) ;; esac
+    ;;
+  *[0-9]m|*[0-9]mb)
+    lowat_num="${lowat_raw%b}"; lowat_num="${lowat_num%m}"
+    case "${lowat_num}" in *[!0-9]*|"") lowat="" ;; *) lowat=$((lowat_num * 1048576)) ;; esac
+    ;;
+  *[!0-9]*|"") lowat="" ;;
+  *) lowat=$((lowat_raw + 0)) ;;
+esac
+if [ -z "${lowat}" ]; then
+  echo "[WARN] Invalid LOWAT \"${LOWAT}\", falling back to default 131072." >&2
+  lowat="131072"
+fi
+
 tproxy_raw=$(printf '%s' "${TPROXY}" | tr -d '[:space:]')
 tproxy_lc=$(printf '%s' "${tproxy_raw}" | tr '[:upper:]' '[:lower:]')
 HAPROXY_BIN=$(command -v haproxy || echo /usr/sbin/haproxy)
@@ -231,7 +251,10 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
     echo "    tcp-request content set-bc-mark ${sock_mark}" >> "${tproxy_out_tmp}"
   fi
 
-  awk -v bind_file="${tproxy_bind_tmp}" -v out_file="${tproxy_out_tmp}" '
+  awk -v bind_file="${tproxy_bind_tmp}" -v out_file="${tproxy_out_tmp}" -v lowat="${lowat}" '
+    (lowat + 0) > 0 && /^[[:space:]]*#[[:space:]]*tune\.notsent-lowat\.(client|server)[[:space:]]/ {
+      sub(/#[[:space:]]*/, ""); sub(/[0-9]+$/, lowat); print; next
+    }
     /# BEGIN_TPROXY_BIND/ { print; while ((getline line < bind_file) > 0) print line; close(bind_file); skip=1; next }
     /# END_TPROXY_BIND/   { skip=0; print; next }
     /# BEGIN_TPROXY_OUT/  { print; while ((getline line < out_file) > 0) print line; close(out_file); skip=1; next }
@@ -252,6 +275,7 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
     echo "Outbound Src : ${out_src:-local auto}"
   fi
   echo "Outbound Mark: ${out_mark:-auto (${sock_mark:-none})}"
+  echo "TCP Lowat    : $([ "${lowat}" = "0" ] && echo "disabled (0)" || echo "${lowat} bytes")"
   echo "Auto Input   : ${auto_input:-disabled (manual iptables)}"
 
   "${HAPROXY_BIN}" -v | head -n 1
@@ -585,6 +609,7 @@ primary_uport="${uport}"
 echo "Run Mode     : SNI/Host Proxy + DNS Unlock (IPv4)"
 echo "Upstream DNS : ${udns_list} (port: ${uport})"
 echo "Hijack DNS   : ${addr} (port: ${port}, dev: ${device})"
+echo "TCP Lowat    : $([ "${lowat}" = "0" ] && echo "disabled (0)" || echo "${lowat} bytes")"
 
 haproxy_ns_tmp="/tmp/haproxy.ns.$$"
 dnsmasq_ns_tmp="/tmp/dnsmasq.ns.$$"
@@ -616,7 +641,10 @@ done
 [ -n "${primary_udns}" ] || primary_udns="8.8.4.4"
 
 if [ -f "${HAPROXY_CONF}" ]; then
-  awk -v ns_file="${haproxy_ns_tmp}" '
+  awk -v ns_file="${haproxy_ns_tmp}" -v lowat="${lowat}" '
+    (lowat + 0) > 0 && /^[[:space:]]*#[[:space:]]*tune\.notsent-lowat\.(client|server)[[:space:]]/ {
+      sub(/#[[:space:]]*/, ""); sub(/[0-9]+$/, lowat); print; next
+    }
     /# BEGIN_UPSTREAM_DNS/ {
       print
       if ((getline line < ns_file) > 0) {

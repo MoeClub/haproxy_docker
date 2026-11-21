@@ -108,6 +108,7 @@ flowchart TD
 | 变量名 | 默认值 | 取值格式与说明 |
 | :--- | :--- | :--- |
 | **`TPROXY`** | *(空)* | **核心模式总开关**：<br>• 留空 / `0` / `false` / `off` / `no`：运行**模式 A**<br>• `clean` / `clear` / `reset`：清除宿主机所有残留 `TPROXY`/`REDIRECT` 规则与策略路由后退出<br>• 其余非空值：运行**模式 B**（详下表） |
+| **`LOWAT`** | `131072` | **TCP 动态背压水位**（同时控制 `tune.notsent-lowat.client` 与 `.server`，初始模板默认注释关闭）：<br>• 大于 `0`（如默认 `131072`，支持 `64k` / `128k` / `256k` 等单位）：自动取消注释并设置对应字节数，启用动态背压攒包与防 Bufferbloat<br>• `0`（或 `off` / `false` / `no` / `none`）：保持注释不启用该特性 |
 | **`TZ`** | `Asia/Shanghai` | 标准时区名称（对应 `/usr/share/zoneinfo/${TZ}`，如 `UTC`、`Asia/Tokyo`） |
 | **`CONF_DIR`** | `/etc/haproxy` | 容器内配置文件目录路径 |
 
