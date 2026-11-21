@@ -84,7 +84,7 @@ flowchart TD
 flowchart TD
     InPkt["过境新建公网 TCP 连接 (SYN)"] --> Layer{"入口网络层类型"}
 
-    Layer -- "三层接口 (ipip-22 / wg / tun / 物理内网口)" --> MangleTP["mangle PREROUTING -> HAPROXY_TP_* (排除 lo/DNAT/REPLY/LOCAL/保留私网, 执行 TPROXY 打标 0x88)"]
+    Layer -- "三层接口 (ipip / wg / tun / 物理内网口)" --> MangleTP["mangle PREROUTING -> HAPROXY_TP_* (排除 lo/DNAT/REPLY/LOCAL/保留私网, 执行 TPROXY 打标 0x88)"]
     MangleTP --> PolicyRt["ip rule pref 200 (fwmark 0x88 -> table 108) 送入 127.0.0.1:tproxy_port (transparent, getsockname 取原目标)"]
 
     Layer -- "二层网桥容器 (docker0 / br-* / podman0)" --> BypassMangle["在 HAPROXY_TP_* 命中 --physdev-in + -j RETURN 跳过 mangle"]
@@ -136,7 +136,7 @@ flowchart TD
 | 取值示例 | 含义说明 |
 | :--- | :--- |
 | `TPROXY=1` *(或 `auto` / `true` / `yes` / `on`)* | **全自动全局接管**：透传客户端源 IP，自动选双空闲端口，自动接管本机除默认公网口以外的所有三层接口与二层网桥容器公网 TCP |
-| `TPROXY=ipip-22` / `TPROXY="192.168.144.0/24;vpns+"` | **按指定入口精准接管**：多个网卡名（支持末尾 `+` 通配符）、网桥名或 IPv4 源地址/网段之间统一用 **`;`** 分隔，其余参数全自动 |
+| `TPROXY=ipip` / `TPROXY="192.168.144.0/24;vpns+"` | **按指定入口精准接管**：多个网卡名（支持末尾 `+` 通配符）、网桥名或 IPv4 源地址/网段之间统一用 **`;`** 分隔，其余参数全自动 |
 | `TPROXY=10888` / `TPROXY=*:10888` / `TPROXY=127.0.0.1:10888` | **指定三层监听端口**，其余参数全自动 |
 | `TPROXY=clean` *(或 `clear` / `reset`)* | **应急一键清理**：清除宿主机残留规则与策略路由后立即退出 |
 
@@ -146,7 +146,7 @@ flowchart TD
 | :--- | :--- | :--- | :--- |
 | 第 1 列 | **`SOURCE`** | `client` | • 留空 / `auto` / `client` / `clientip`：透明绑定原客户端源 IP（`usesrc clientip`）<br>• `local` / `*` / `0.0.0.0`：改用宿主机自身出口 IP 发起后段连接<br>• `<IPv4>`（如 `10.255.22.1`）：强制绑定指定源 IPv4 地址 |
 | 第 2 列 | **`[BIND:]PORT`** | `127.0.0.1:auto` | 三层 `TPROXY` 监听地址与端口：<br>• `BIND`：省略或留空为 `127.0.0.1`；填 `*` 为 `0.0.0.0`；或填具体本机 IPv4<br>• `PORT`：省略 / `0` / `auto` 自动从 `10000~29999` 挑选空闲端口；或填 `1~65535`（开启自动拦截时，二层 `REDIRECT` 端口始终另行自动分配空闲端口并在 `INPUT` 封堵非重定向直连） |
-| 第 3 列 | **`INPUT`** | `auto` | • 留空 / `auto` / `all` / `1` / `true`：自动挂载 `! -i <默认公网口>`<br>• `off` / `none` / `0` / `manual` / `false`：关闭自动 `iptables` 与策略路由，仅前台运行 HAProxy<br>• `<入口列表>`：用 `;` 分隔的网卡名（如 `ipip-22`、`vpns+`）、网桥名（如 `docker0`）或源 IPv4/CIDR（如 `192.168.144.0/24`） |
+| 第 3 列 | **`INPUT`** | `auto` | • 留空 / `auto` / `all` / `1` / `true`：自动挂载 `! -i <默认公网口>`<br>• `off` / `none` / `0` / `manual` / `false`：关闭自动 `iptables` 与策略路由，仅前台运行 HAProxy<br>• `<入口列表>`：用 `;` 分隔的网卡名（如 `ipip`、`vpns+`）、网桥名（如 `docker0`）或源 IPv4/CIDR（如 `192.168.144.0/24`） |
 | 第 4 列 | **`FWMARK`** | *(自动)* | • 留空 / `0` / `0x0`：当 `SOURCE` 非 `local` 时自动使用内部 `0x89` 做回包追踪<br>• 十进制（如 `100`）或十六进制（如 `0x64`）：设置后端出站包 `fwmark`；若宿主机存在同号路由表（`table 100`），自动添加 `ip rule pref 201 fwmark <值> lookup <值>` |
 
 ---
@@ -184,7 +184,7 @@ docker run --restart always --name haproxy-tproxy \
 # 场景 2：精准接管指定隧道口与指定容器网段（多路用 ; 分隔）
 docker run --restart always --name haproxy-tproxy \
   --network host --privileged \
-  -e "TPROXY=ipip-22;192.168.144.0/24" \
+  -e "TPROXY=ipip;192.168.144.0/24" \
   -dt ocserv/haproxy
 
 # 场景 3：应急一键清理（若曾用 docker rm -f / kill -9 强杀容器且不再启动代理时）
