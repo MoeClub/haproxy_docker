@@ -1,0 +1,16 @@
+# HAProxy 动态路由映射表（启动时由 run.sh 根据环境变量 TABLE 自动生成）
+# 左列键前缀含义：
+#   ^domain.com    -> 仅精确匹配根域名/单域名本身（不含子域名）
+#   .domain.com    -> 仅匹配泛子域名 *.domain.com（不含根域名）
+#   （TABLE 中默认写 domain.com 时会自动同时生成 ^domain.com 和 .domain.com 两行）
+#
+# 右列值格式：<目标主机>:<目标端口>[/proxy|proxy-v1|http] 或 *
+#
+# 示例：
+# ^abc.net             *:50443/proxy
+# .abc.net             *:50443/proxy
+# ^xyz.com             *:10443
+# .xyz.com             *:20443
+# ^legacy.xyz.com      10.0.0.2:30443/proxy-v1
+# ^openai.com          *
+# .openai.com          *
