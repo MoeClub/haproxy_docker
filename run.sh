@@ -18,6 +18,41 @@ for f in "${DNS_CONF}" "${HAPROXY_CONF}" "${TPROXY_CONF}"; do
     cp -f "${f}.tpl" "${f}"
   fi
 done
+if [ -f "${MAP_FILE}" ] && [ ! -f "${MAP_FILE}.tpl" ]; then
+  cp -f "${MAP_FILE}" "${MAP_FILE}.tpl"
+fi
+if [ -f "${MAP_FILE}.tpl" ] && grep -Eq '^# Auto-generated from (TABLE|ALLOW|DENY) ' "${MAP_FILE}" 2>/dev/null; then
+  cp -f "${MAP_FILE}.tpl" "${MAP_FILE}"
+fi
+
+is_ipv4() {
+  case "$1" in
+    ""|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+  esac
+  ip_rem="$1."
+  ip_cnt=0
+  while [ -n "${ip_rem}" ]; do
+    ip_oct="${ip_rem%%.*}"
+    ip_rem="${ip_rem#*.}"
+    ip_cnt=$((ip_cnt + 1))
+    case "${ip_oct}" in ""|0[0-9]*) return 1 ;; esac
+    [ "${ip_cnt}" -le 4 ] && [ "${ip_oct}" -le 255 ] || return 1
+  done
+  [ "${ip_cnt}" -eq 4 ]
+}
+
+is_port() {
+  case "$1" in
+    ""|0*|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+default_route_dev() {
+  dev_out=$(ip -4 route show default table main 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  [ -n "${dev_out}" ] || dev_out=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  printf '%s' "${dev_out}"
+}
 
 # 2. 时区设置
 if [ -n "${TZ}" ] && [ -e "/usr/share/zoneinfo/${TZ}" ]; then
@@ -33,14 +68,23 @@ case "${lowat_raw}" in
   0|0k|0kb|0m|0mb|off|false|no|none) lowat="0" ;;
   *[0-9]k|*[0-9]kb)
     lowat_num="${lowat_raw%b}"; lowat_num="${lowat_num%k}"
-    case "${lowat_num}" in *[!0-9]*|"") lowat="" ;; *) lowat=$((lowat_num * 1024)) ;; esac
+    case "${lowat_num}" in
+      *[!0-9]*|"") lowat="" ;;
+      *) lowat_num=$(printf '%s' "${lowat_num}" | sed 's/^0*//'); lowat=$(( ${lowat_num:-0} * 1024 )) ;;
+    esac
     ;;
   *[0-9]m|*[0-9]mb)
     lowat_num="${lowat_raw%b}"; lowat_num="${lowat_num%m}"
-    case "${lowat_num}" in *[!0-9]*|"") lowat="" ;; *) lowat=$((lowat_num * 1048576)) ;; esac
+    case "${lowat_num}" in
+      *[!0-9]*|"") lowat="" ;;
+      *) lowat_num=$(printf '%s' "${lowat_num}" | sed 's/^0*//'); lowat=$(( ${lowat_num:-0} * 1048576 )) ;;
+    esac
     ;;
   *[!0-9]*|"") lowat="" ;;
-  *) lowat=$((lowat_raw + 0)) ;;
+  *)
+    lowat_num=$(printf '%s' "${lowat_raw}" | sed 's/^0*//')
+    lowat=$(( ${lowat_num:-0} + 0 ))
+    ;;
 esac
 if [ -z "${lowat}" ]; then
   echo "[WARN] Invalid LOWAT \"${LOWAT}\", falling back to default 131072." >&2
@@ -75,15 +119,12 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
     ipt_bin="$1"
     command -v "${ipt_bin}" >/dev/null 2>&1 || return 0
 
-    # 1) 清理 mangle 表挂载规则与残留子链（若存在旧版遗留的 HAPROXY_BRNF_1 状态链，自动修复恢复宿主机网桥状态）
+    # 1) 清理 mangle 表挂载规则与残留子链
     "${ipt_bin}" -t mangle -S 2>/dev/null | grep -E '^-A (PREROUTING|OUTPUT|POSTROUTING) .*(HAPROXY_(TP|DIV|MSS)_|--set-xmark 0x88/|CONNMARK --set-mark 0x88)' | while IFS= read -r rule; do
       del_args="-D ${rule#-A }"
       ( set -f; "${ipt_bin}" -t mangle ${del_args} ) 2>/dev/null || true
     done
-    if "${ipt_bin}" -t mangle -S 2>/dev/null | grep -q '^-N HAPROXY_BRNF_1$'; then
-      [ -w /proc/sys/net/bridge/bridge-nf-call-iptables ] && echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || true
-    fi
-    "${ipt_bin}" -t mangle -S 2>/dev/null | awk '/^-N HAPROXY_(TP|DIV|MSS|BRNF)_/ {print $2}' | while IFS= read -r ch; do
+    "${ipt_bin}" -t mangle -S 2>/dev/null | awk '/^-N HAPROXY_(TP|DIV|MSS)_/ {print $2}' | while IFS= read -r ch; do
       "${ipt_bin}" -t mangle -F "${ch}" 2>/dev/null || true
       "${ipt_bin}" -t mangle -X "${ch}" 2>/dev/null || true
     done
@@ -128,6 +169,7 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
 
   [ -f "${TPROXY_CONF}" ] || { echo "[ERROR] Missing ${TPROXY_CONF}" >&2; exit 1; }
 
+  out_src=""; bind_ip=""; tproxy_port=""; auto_input=""; out_mark=""
   eval "$(printf '%s\n' "${tproxy_raw}" | awk '
     function parse_bp(s,    cpos, plc) {
       if (s == "" || s == "0" || tolower(s) == "auto") {
@@ -173,7 +215,7 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
       } else if (slc == "local" || slc == "*" || slc == "0.0.0.0") {
         src = ""
       } else {
-        gsub(/[^0-9.]/, "", src)
+        gsub(/[^0-9a-zA-Z._-]/, "", src)
       }
 
       ilc = tolower(inp)
@@ -185,10 +227,15 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
         gsub(/[^0-9a-zA-Z_.\/+;-]/, "", inp)
       }
 
-      gsub(/[^0-9.]/, "", b_ip)
-      if (b_pt != "auto") gsub(/[^0-9]/, "", b_pt)
-      gsub(/[^0-9xXa-fA-F]/, "", mk)
-      if (mk ~ /^(0+|0[xX]0+)$/) mk = ""
+      gsub(/[^0-9a-zA-Z._-]/, "", b_ip)
+      if (b_pt != "auto") gsub(/[^0-9a-zA-Z._-]/, "", b_pt)
+      gsub(/[[:space:]]/, "", mk)
+      mlc = tolower(mk)
+      if (mlc == "" || mlc == "auto" || mlc == "off" || mlc == "none" || mlc == "false" || mlc ~ /^(0+|0x0+)$/) {
+        mk = ""
+      } else {
+        gsub(/[^0-9xXa-fA-Fg-zG-Z_-]/, "", mk)
+      }
 
       printf "out_src=\"%s\"\nbind_ip=\"%s\"\ntproxy_port=\"%s\"\nauto_input=\"%s\"\nout_mark=\"%s\"\n", src, b_ip, b_pt, inp, mk
     }
@@ -220,13 +267,16 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
 
   [ "${tproxy_port}" = "auto" ] && tproxy_port=$(pick_free_port 0)
 
-  if ! printf '%s\n' "${bind_ip}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || \
-     ! printf '%s\n' "${tproxy_port}" | grep -Eq '^[1-9][0-9]*$' || [ "${tproxy_port}" -gt 65535 ]; then
+  if ! is_ipv4 "${bind_ip}" || ! is_port "${tproxy_port}"; then
     echo "[ERROR] Invalid TPROXY specification: \"${TPROXY}\"" >&2
     exit 1
   fi
-  if [ -n "${out_src}" ] && [ "${out_src}" != "client" ] && ! printf '%s\n' "${out_src}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+  if [ -n "${out_src}" ] && [ "${out_src}" != "client" ] && ! is_ipv4 "${out_src}"; then
     echo "[ERROR] Invalid IPv4 SOURCE in TPROXY specification: \"${TPROXY}\"" >&2
+    exit 1
+  fi
+  if [ -n "${out_mark}" ] && ! printf '%s\n' "${out_mark}" | grep -Eq '^(0[xX][0-9a-fA-F]+|[1-9][0-9]*)$'; then
+    echo "[ERROR] Invalid FWMARK in TPROXY specification: \"${TPROXY}\"" >&2
     exit 1
   fi
 
@@ -235,6 +285,8 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
 
   tproxy_bind_tmp="/tmp/tproxy.bind.$$"
   tproxy_out_tmp="/tmp/tproxy.out.$$"
+  tproxy_flt_tmp="/tmp/tproxy.flt.$$"
+  tproxy_http_tmp="/tmp/tproxy.http.$$"
   echo "    bind ${bind_ip}:${tproxy_port} transparent backlog 4096" > "${tproxy_bind_tmp}"
   [ -n "${redir_port}" ] && echo "    bind 0.0.0.0:${redir_port} backlog 4096" >> "${tproxy_bind_tmp}"
 
@@ -251,17 +303,212 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
     echo "    tcp-request content set-bc-mark ${sock_mark}" >> "${tproxy_out_tmp}"
   fi
 
-  awk -v bind_file="${tproxy_bind_tmp}" -v out_file="${tproxy_out_tmp}" -v lowat="${lowat}" '
+  # 解析可选的域名:端口黑白名单 ALLOW / DENY（互斥；同时有值时优先使用 ALLOW 并清空 DENY）
+  allow_clean=$(printf '%s' "${ALLOW}" | tr -d '[:space:]')
+  deny_clean=$(printf '%s' "${DENY}" | tr -d '[:space:]')
+  filter_mode=""
+  filter_raw=""
+  allow_strict_port="0"
+  filter_ports=""
+
+  if [ -n "${allow_clean}" ]; then
+    filter_mode="ALLOW"
+    filter_raw="${ALLOW}"
+    if [ -n "${deny_clean}" ]; then
+      echo "[INFO] Both ALLOW and DENY are set; using ALLOW and clearing DENY." >&2
+    fi
+    DENY=""
+    unset DENY
+  elif [ -n "${deny_clean}" ]; then
+    filter_mode="DENY"
+    filter_raw="${DENY}"
+  fi
+
+  if [ -n "${filter_mode}" ]; then
+    tmp_fmap="/tmp/tproxy.fmap.$$"
+    tmp_fports="/tmp/tproxy.fports.$$"
+    tmp_fstrict="/tmp/tproxy.fstrict.$$"
+    : > "${tmp_fmap}"
+    : > "${tmp_fports}"
+    echo "0" > "${tmp_fstrict}"
+
+    printf '%s\n' "${filter_raw}" | tr -d '\r' | tr ';' '\n' | awk \
+      -v fmode="${filter_mode}" -v ports_out="${tmp_fports}" -v strict_out="${tmp_fstrict}" '
+      function trim(s) {
+        sub(/^[[:space:]]+/, "", s)
+        sub(/[[:space:]]+$/, "", s)
+        return s
+      }
+      {
+        line = trim($0)
+        if (line == "" || substr(line, 1, 1) == "#") next
+
+        if (substr(line, 1, 1) == "+") {
+          strict_port = 1
+          sub(/^\++/, "", line)
+          line = trim(line)
+          if (line == "") next
+        }
+
+        if (substr(line, 1, 1) == "[" || index(line, ",") > 0 || split(line, cp, ":") > 2) {
+          printf "[WARN] Skipping invalid %s entry: %s\n", fmode, line > "/dev/stderr"
+          next
+        }
+
+        n_col = split(line, cp, ":")
+        raw_dom = trim(cp[1])
+        if (n_col == 2) {
+          raw_pt = trim(cp[2])
+          if (raw_pt !~ /^[1-9][0-9]*$/ || (raw_pt + 0) > 65535) {
+            printf "[WARN] Skipping %s entry with invalid port \"%s\": %s\n", fmode, raw_pt, line > "/dev/stderr"
+            next
+          }
+          n_pts = 1; pts[1] = raw_pt + 0
+        } else {
+          n_pts = 2; pts[1] = 80; pts[2] = 443
+        }
+
+        dom_low = tolower(raw_dom)
+        if (substr(dom_low, 1, 1) == "^" || substr(dom_low, 1, 1) == "@") {
+          granularity = "exact"
+          dom = substr(dom_low, 2)
+        } else if (substr(dom_low, 1, 2) == "*.") {
+          granularity = "wild"
+          dom = substr(dom_low, 3)
+        } else {
+          granularity = "both"
+          dom = dom_low
+        }
+        sub(/^\*+/, "", dom)
+        sub(/^\.+/, "", dom)
+        sub(/\.+$/, "", dom)
+        if (dom == "" || length(dom) > 253 || dom ~ /[^0-9a-z._-]/) {
+          printf "[WARN] Skipping invalid domain in %s: %s\n", fmode, line > "/dev/stderr"
+          next
+        }
+        if (dom ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          printf "[WARN] Skipping IPv4 literal in %s (IP connections always pass through): %s\n", fmode, line > "/dev/stderr"
+          next
+        }
+
+        for (pi = 1; pi <= n_pts; pi++) {
+          pt = pts[pi]
+          port_set[pt] = 1
+          k = dom ":" pt
+          dom_len[k] = length(dom)
+          key_pt[k]  = pt
+          keys[k]    = 1
+          if (granularity == "exact" || granularity == "both") exact_map[k] = 1
+          if (granularity == "wild"  || granularity == "both") wild_map[k]  = 1
+        }
+      }
+      END {
+        printf "%d\n", (strict_port ? 1 : 0) > strict_out
+        for (p in port_set) {
+          printf "%d\n", p >> ports_out
+        }
+        for (k in keys) {
+          len = dom_len[k]
+          pt  = key_pt[k]
+          if (k in exact_map) printf "%d\t2\t%d\t%-42s 1\n", len, pt, "^" k
+          if (k in wild_map)  printf "%d\t1\t%d\t%-42s 1\n", len, pt, "." k
+        }
+      }
+    ' | sort -k1,1rn -k2,2rn -k3,3n | cut -f4- > "${tmp_fmap}"
+
+    if [ ! -s "${tmp_fmap}" ]; then
+      rm -f "${tmp_fmap}" "${tmp_fports}" "${tmp_fstrict}" "${tproxy_bind_tmp}" "${tproxy_out_tmp}"
+      echo "[ERROR] No valid domain entries found in ${filter_mode}." >&2
+      exit 1
+    fi
+
+    allow_strict_port=$(cat "${tmp_fstrict}")
+    filter_ports=$(sort -n "${tmp_fports}" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+    {
+      echo "# Auto-generated from ${filter_mode} environment variable (Mode B TPROXY)"
+      cat "${tmp_fmap}"
+    } > "${MAP_FILE}"
+    rm -f "${tmp_fmap}" "${tmp_fports}" "${tmp_fstrict}"
+
+    {
+      printf '%s\n' "${filter_ports}" | tr ' ' '\n' | awk '
+        NF > 0 {
+          line = (line == "") ? $1 : (line " " $1)
+          if (++n == 16) { printf "    acl filter_port dst_port %s\n", line; line = ""; n = 0 }
+        }
+        END { if (n > 0) printf "    acl filter_port dst_port %s\n", line }
+      '
+      if [ "${filter_mode}" = "ALLOW" ] && [ "${allow_strict_port}" = "1" ]; then
+        echo '    tcp-request content reject if !filter_port'
+      else
+        echo '    tcp-request content accept if !filter_port'
+      fi
+      echo '    tcp-request inspect-delay 500ms'
+      echo '    tcp-request content switch-mode http if HTTP'
+      echo '    tcp-request content set-var(sess.host_log) req.ssl_sni if { req.ssl_hello_type 1 } { req.ssl_sni -m found }'
+      echo '    tcp-request content set-var(sess.req_sni)  req.ssl_sni,lower,rtrim(.) if { req.ssl_hello_type 1 } { req.ssl_sni -m found }'
+      echo '    tcp-request content set-var-fmt(sess.match_key) ^%[var(sess.req_sni)]:%[dst_port] if { var(sess.req_sni) -m len 1:253 } !{ var(sess.req_sni) -m reg ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ }'
+      echo "    tcp-request content set-var(sess.hit) var(sess.match_key),map_end(${MAP_FILE}) if { var(sess.match_key) -m found }"
+      if [ "${filter_mode}" = "DENY" ]; then
+        echo '    tcp-request content reject if { var(sess.hit) -m found }'
+      else
+        echo '    tcp-request content reject if { var(sess.match_key) -m found } !{ var(sess.hit) -m found }'
+      fi
+      echo '    tcp-request content accept'
+      echo '    use_backend http_tproxy_out if HTTP'
+    } > "${tproxy_flt_tmp}"
+
+    {
+      echo 'backend http_tproxy_out'
+      echo '    mode http'
+      echo '    timeout http-request    5s'
+      echo '    timeout http-keep-alive 60s'
+      if [ "${out_src}" = "client" ]; then
+        echo '    source 0.0.0.0 usesrc clientip'
+      elif [ -n "${out_src}" ]; then
+        echo "    source ${out_src}"
+      fi
+      echo '    http-request unset-var(sess.host_log)'
+      echo '    http-request set-var(sess.host_log) req.hdr(host) if { req.hdr(host) -m found }'
+      echo '    http-request reject if { req.hdr_cnt(host) gt 1 }'
+      echo '    http-request set-var(txn.req_host)  req.hdr(host),host_only,lower,rtrim(.) if { req.hdr(host) -m found }'
+      echo '    http-request set-var-fmt(txn.match_key) ^%[var(txn.req_host)]:%[dst_port] if { var(txn.req_host) -m len 1:253 } !{ var(txn.req_host) -m reg ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ }'
+      echo "    http-request set-var(txn.hit) var(txn.match_key),map_end(${MAP_FILE}) if { var(txn.match_key) -m found }"
+      if [ "${filter_mode}" = "DENY" ]; then
+        echo '    http-request reject if { var(txn.hit) -m found }'
+      else
+        echo '    http-request reject if { var(txn.match_key) -m found } !{ var(txn.hit) -m found }'
+      fi
+      if [ -n "${sock_mark}" ]; then
+        echo "    http-request set-bc-mark ${sock_mark}"
+      fi
+      echo '    http-request set-dst      dst'
+      echo '    http-request set-dst-port dst_port'
+      echo '    server next_hop_http 0.0.0.0:0'
+    } > "${tproxy_http_tmp}"
+  fi
+
+  awk -v bind_file="${tproxy_bind_tmp}" -v out_file="${tproxy_out_tmp}" \
+      -v flt_file="${tproxy_flt_tmp}" -v http_file="${tproxy_http_tmp}" \
+      -v fmode="${filter_mode}" -v lowat="${lowat}" '
     (lowat + 0) > 0 && /^[[:space:]]*#[[:space:]]*tune\.notsent-lowat\.(client|server)[[:space:]]/ {
-      sub(/#[[:space:]]*/, ""); sub(/[0-9]+$/, lowat); print; next
+      sub(/#[[:space:]]*/, ""); sub(/[0-9]+/, lowat); print; next
+    }
+    fmode != "" && /^[[:space:]]*log-format[[:space:]]/ {
+      print "    log-format \"%ci:%cp [TPROXY] %[var(sess.host_log)] => %fi:%fp [%B bytes, %Tt ms, %ts]\""
+      next
     }
     /# BEGIN_TPROXY_BIND/ { print; while ((getline line < bind_file) > 0) print line; close(bind_file); skip=1; next }
     /# END_TPROXY_BIND/   { skip=0; print; next }
+    /# BEGIN_TPROXY_FILTER/ && fmode != "" { print; while ((getline line < flt_file) > 0) print line; close(flt_file); skip=1; next }
+    /# END_TPROXY_FILTER/   && fmode != "" { skip=0; print; next }
     /# BEGIN_TPROXY_OUT/  { print; while ((getline line < out_file) > 0) print line; close(out_file); skip=1; next }
     /# END_TPROXY_OUT/    { skip=0; print; next }
+    /# BEGIN_TPROXY_HTTP_OUT/ && fmode != "" { print; while ((getline line < http_file) > 0) print line; close(http_file); skip=1; next }
+    /# END_TPROXY_HTTP_OUT/   && fmode != "" { skip=0; print; next }
     !skip { print }
   ' "${TPROXY_CONF}" > "${TPROXY_CONF}.new" && mv -f "${TPROXY_CONF}.new" "${TPROXY_CONF}"
-  rm -f "${tproxy_bind_tmp}" "${tproxy_out_tmp}"
+  rm -f "${tproxy_bind_tmp}" "${tproxy_out_tmp}" "${tproxy_flt_tmp}" "${tproxy_http_tmp}"
 
   echo "Run Mode     : TPROXY Universal Transparent Split-TCP Plug (IPv4)"
   if [ -n "${redir_port}" ]; then
@@ -276,7 +523,21 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
   fi
   echo "Outbound Mark: ${out_mark:-auto (${sock_mark:-none})}"
   echo "TCP Lowat    : $([ "${lowat}" = "0" ] && echo "disabled (0)" || echo "${lowat} bytes")"
+  if [ "${filter_mode}" = "DENY" ]; then
+    echo "Domain Filter: DENY blacklist (ports: ${filter_ports}; unlisted ports: accept)"
+  elif [ "${filter_mode}" = "ALLOW" ] && [ "${allow_strict_port}" = "1" ]; then
+    echo "Domain Filter: ALLOW+ strict whitelist (ports: ${filter_ports}; unlisted ports: reject)"
+  elif [ "${filter_mode}" = "ALLOW" ]; then
+    echo "Domain Filter: ALLOW whitelist (ports: ${filter_ports}; unlisted ports: accept)"
+  else
+    echo "Domain Filter: disabled (pure L4 zero-copy passthrough)"
+  fi
   echo "Auto Input   : ${auto_input:-disabled (manual iptables)}"
+  if [ -n "${filter_mode}" ]; then
+    echo "--- Active ${filter_mode} Rules (${MAP_FILE}) ---"
+    grep -vE '^[[:space:]]*(#|$)' "${MAP_FILE}" || echo "(empty)"
+    echo "------------------------------------------"
+  fi
 
   "${HAPROXY_BIN}" -v | head -n 1
   "${HAPROXY_BIN}" -c -f "${TPROXY_CONF}"
@@ -307,8 +568,7 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
   OUT_CHAIN="HAPROXY_OUT_${tproxy_port}"
   on_ip="${bind_ip}"
   [ "${on_ip}" = "0.0.0.0" ] && on_ip="127.0.0.1"
-  WAN_DEV=$(ip -4 route show default table main 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-  [ -n "${WAN_DEV}" ] || WAN_DEV=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+  WAN_DEV=$(default_route_dev)
 
   setup_tproxy() {
     cleanup_tproxy
@@ -346,10 +606,8 @@ if [ -n "${tproxy_lc}" ] && [ "${tproxy_lc}" != "0" ] && [ "${tproxy_lc}" != "fa
     }
 
     # 若显式指定了非零 FWMARK（如 100 或 0x64）且宿主机存在对应路由表，自动挂载出站策略路由
-    if [ -n "${out_mark}" ] && printf '%s\n' "${out_mark}" | grep -Eq '^(0[xX][0-9a-fA-F]+|[1-9][0-9]*)$'; then
-      if [ -n "$(ip route show table "${out_mark}" 2>/dev/null)" ]; then
-        ip rule add pref "${OUT_PRIO}" fwmark "${out_mark}" lookup "${out_mark}"
-      fi
+    if [ -n "${out_mark}" ] && [ -n "$(ip route show table "${out_mark}" 2>/dev/null)" ]; then
+      ip rule add pref "${OUT_PRIO}" fwmark "${out_mark}" lookup "${out_mark}"
     fi
 
     # 建立本地 TPROXY 接收路由表
@@ -541,18 +799,16 @@ fi
 # 模式 A（默认 TPROXY=0）：SNI / Host 动态分流 + Dnsmasq 解锁模式（纯 IPv4）
 # =====================================================================
 device="${DEVICE}"
-if [ -z "${device}" ]; then
-  device=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-fi
+[ -n "${device}" ] || device=$(default_route_dev)
 if [ -z "${device}" ]; then
   device=$(ls -1 /sys/class/net | grep -v '^lo$' | head -n 1)
 fi
 [ -n "${device}" ] || { echo "[ERROR] No network device found." >&2; exit 1; }
 
 # 探测本机公网 IPv4 (ADDR)
-addr="${ADDR}"
-if [ -n "${addr}" ] && ! printf '%s\n' "${addr}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-  echo "[WARN] Invalid IPv4 ADDR \"${addr}\", falling back to auto-detection." >&2
+addr=$(printf '%s' "${ADDR}" | tr -d '[:space:]')
+if [ -n "${addr}" ] && ! is_ipv4 "${addr}"; then
+  echo "[WARN] Invalid IPv4 ADDR \"${ADDR}\", falling back to auto-detection." >&2
   addr=""
 fi
 
@@ -567,7 +823,7 @@ fetch_ip_api() {
 if [ -z "${addr}" ]; then
   for api in "https://checkip.amazonaws.com/" "https://ipv4.icanhazip.com/" "https://api.ipify.org"; do
     raw_ip=$(fetch_ip_api "${api}")
-    if printf '%s\n' "${raw_ip}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    if is_ipv4 "${raw_ip}"; then
       addr="${raw_ip}"
       break
     fi
@@ -583,17 +839,17 @@ if [ -z "${addr}" ]; then
   exit 1
 fi
 
-uport="${UPORT:-53}"
-if ! printf '%s\n' "${uport}" | grep -Eq '^[1-9][0-9]*$' || [ "${uport}" -gt 65535 ]; then
-  echo "[WARN] Invalid UPORT \"${uport}\", falling back to 53." >&2
+uport=$(printf '%s' "${UPORT:-53}" | tr -d '[:space:]')
+if ! is_port "${uport}"; then
+  echo "[WARN] Invalid UPORT \"${UPORT}\", falling back to 53." >&2
   uport="53"
 fi
 
-port_lc=$(printf '%s' "${PORT:-3535}" | tr '[:upper:]' '[:lower:]')
+port_lc=$(printf '%s' "${PORT:-3535}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
 case "${port_lc}" in
   0|off|false|no|none) port="0" ;;
   *)
-    if printf '%s\n' "${port_lc}" | grep -Eq '^[1-9][0-9]*$' && [ "${port_lc}" -le 65535 ]; then
+    if is_port "${port_lc}"; then
       port="${port_lc}"
     else
       echo "[ERROR] Invalid DNS listen PORT: \"${PORT}\"" >&2
@@ -617,6 +873,7 @@ dnsmasq_ns_tmp="/tmp/dnsmasq.ns.$$"
 : > "${dnsmasq_ns_tmp}"
 
 idx=1
+set -f
 for ns in $(printf '%s' "${udns_list}" | tr ';' ' '); do
   clean_ns=$(printf '%s' "${ns}" | tr -d '[:space:]')
   [ -n "${clean_ns}" ] || continue
@@ -625,8 +882,7 @@ for ns in $(printf '%s' "${udns_list}" | tr ';' ' '); do
     *:* ) ns_ip="${clean_ns%%:*}"; ns_pt="${clean_ns#*:}" ;;
     *   ) ns_ip="${clean_ns}";     ns_pt="${uport}" ;;
   esac
-  if ! printf '%s\n' "${ns_ip}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || \
-     ! printf '%s\n' "${ns_pt}" | grep -Eq '^[1-9][0-9]*$' || [ "${ns_pt}" -gt 65535 ]; then
+  if ! is_ipv4 "${ns_ip}" || ! is_port "${ns_pt}"; then
     echo "[WARN] Skipping invalid IPv4 upstream DNS entry: ${clean_ns}" >&2
     continue
   fi
@@ -638,12 +894,13 @@ for ns in $(printf '%s' "${udns_list}" | tr ';' ' '); do
   echo "server=${ns_ip}#${ns_pt}" >> "${dnsmasq_ns_tmp}"
   idx=$((idx + 1))
 done
+set +f
 [ -n "${primary_udns}" ] || primary_udns="8.8.4.4"
 
 if [ -f "${HAPROXY_CONF}" ]; then
-  awk -v ns_file="${haproxy_ns_tmp}" -v lowat="${lowat}" '
+  awk -v ns_file="${haproxy_ns_tmp}" -v map_file="${MAP_FILE}" -v lowat="${lowat}" '
     (lowat + 0) > 0 && /^[[:space:]]*#[[:space:]]*tune\.notsent-lowat\.(client|server)[[:space:]]/ {
-      sub(/#[[:space:]]*/, ""); sub(/[0-9]+$/, lowat); print; next
+      sub(/#[[:space:]]*/, ""); sub(/[0-9]+/, lowat); print; next
     }
     /# BEGIN_UPSTREAM_DNS/ {
       print
@@ -656,7 +913,14 @@ if [ -f "${HAPROXY_CONF}" ]; then
       next
     }
     /# END_UPSTREAM_DNS/ { skip = 0; print; next }
-    !skip { print }
+    !skip {
+      if (map_file != "/etc/haproxy/haproxy.map") {
+        while ((p = index($0, "/etc/haproxy/haproxy.map")) > 0) {
+          $0 = substr($0, 1, p - 1) map_file substr($0, p + 24)
+        }
+      }
+      print
+    }
   ' "${HAPROXY_CONF}" > "${HAPROXY_CONF}.new" && mv -f "${HAPROXY_CONF}.new" "${HAPROXY_CONF}"
 fi
 
@@ -723,7 +987,10 @@ if [ -n "${TABLE}" ]; then
       sub(/^\*+/, "", src)
       sub(/^\.+/, "", src)
       sub(/\.+$/, "", src)
-      if (src == "") next
+      if (src == "" || length(src) > 253 || src ~ /[^0-9a-z._-]/) {
+        printf "[WARN] Skipping invalid domain in TABLE: %s\n", line > "/dev/stderr"
+        next
+      }
 
       if (mode == "" && tolower(dst) ~ /[[:space:]]+proxy(_protocol)?$/) {
         mode = "proxy"
@@ -750,10 +1017,26 @@ if [ -n "${TABLE}" ]; then
         if (!has_custom_dst) {
           host_port = (mode == "http") ? "*:80" : "*:443"
         } else if (dst ~ /^[0-9]+$/) {
+          if ((dst + 0) < 1 || (dst + 0) > 65535 || substr(dst, 1, 1) == "0") {
+            printf "[WARN] Skipping TABLE entry with invalid port \"%s\": %s\n", dst, line > "/dev/stderr"
+            next
+          }
           host_port = "*:" dst
         } else if (index(dst, ":") > 0) {
-          host_port = dst
+          split(dst, hp_chk, ":")
+          d_host = trim(hp_chk[1])
+          d_port = trim(hp_chk[2])
+          if (d_host == "") d_host = "*"
+          if (d_port !~ /^[1-9][0-9]*$/ || (d_port + 0) > 65535 || (d_host != "*" && (length(d_host) > 253 || d_host ~ /[^0-9a-zA-Z._-]/))) {
+            printf "[WARN] Skipping TABLE entry with invalid target \"%s\": %s\n", dst, line > "/dev/stderr"
+            next
+          }
+          host_port = d_host ":" d_port
         } else {
+          if (length(dst) > 253 || dst ~ /[^0-9a-zA-Z._-]/) {
+            printf "[WARN] Skipping TABLE entry with invalid target \"%s\": %s\n", dst, line > "/dev/stderr"
+            next
+          }
           host_port = dst ":" ((mode == "http") ? "80" : "443")
         }
 

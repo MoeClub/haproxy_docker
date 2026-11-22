@@ -2,7 +2,7 @@
 
 同一个镜像内置两组纯 IPv4 生产配置，通过环境变量 **`TPROXY`** 一键切换：
 1. **模式 A（默认不传 `TPROXY` 或设为 `0`）**：**SNI / Host 动态分流 + 单实例 Dnsmasq 解锁模式**（加载 `haproxy.cfg` + `haproxy.map` + `dnsmasq.conf`，全程与宿主机 DNS 物理隔离）。
-2. **模式 B（传入 `TPROXY=1` 或 `TPROXY=<网卡/网段>`）**：**通用即插即用透明四层 TCP 截断插口模式**（加载 `haproxy-tproxy.cfg`，采用**三层 `TPROXY` + 二层网桥 `NAT REDIRECT` 双引擎**，完全不修改宿主机 `bridge-nf-call-iptables`，无缝兼容非 host 网桥容器、跨容器公网映射端口互访 Hairpin DNAT 与 K8s，默认利用 `usesrc clientip` 原样继承宿主机策略路由与 NAT，`docker stop` 自动无损还原）。
+2. **模式 B（传入 `TPROXY=1` 或 `TPROXY=<网卡/网段>`）**：**通用即插即用透明四层 TCP 截断插口模式**（加载 `haproxy-tproxy.cfg`，采用**三层 `TPROXY` + 二层网桥 `NAT REDIRECT` 双引擎**，完全不修改宿主机 `bridge-nf-call-iptables`，无缝兼容非 host 网桥容器、跨容器公网映射端口互访 Hairpin DNAT 与 K8s，默认利用 `usesrc clientip` 原样继承宿主机策略路由与 NAT，可选通过 `ALLOW` / `DENY` 开启按 `域名:端口` 管控的透明过滤，`docker stop` 自动无损还原）。
 
 ---
 
@@ -11,9 +11,9 @@
 | 文件名 | 容器内路径 | 作用说明 |
 | :--- | :--- | :--- |
 | `haproxy.cfg` | `/etc/haproxy/haproxy.cfg` | **模式 A** 配置：80/443 SNI/Host 动态分流、三种域名粒度、PROXY v1/v2、443 明文 HTTP 跳 HTTPS、防自环保护 |
-| `haproxy.map` | `/etc/haproxy/haproxy.map` | **模式 A** 路由映射表（启动时由 `run.sh` 解析 `TABLE` 自动排序生成） |
+| `haproxy.map` | `/etc/haproxy/haproxy.map` | 动态映射表（启动时由 `run.sh` 解析模式 A 的 `TABLE` 或模式 B 的 `ALLOW` / `DENY` 自动排序生成） |
 | `dnsmasq.conf` | `/etc/haproxy/dnsmasq.conf` | **模式 A** 对外劫持 DNS 配置（默认 `3535/udp`，开启 `no-resolv`/`no-hosts`，自动过滤 `AAAA`/`HTTPS`/`SVCB`/`ANY`） |
-| `haproxy-tproxy.cfg` | `/etc/haproxy/haproxy-tproxy.cfg` | **模式 B** 配置：三层 `TPROXY` + 二层网桥 `REDIRECT` 双引擎全端口透明 TCP 截断重建，内置 `dst_is_local` 防自环保护 |
+| `haproxy-tproxy.cfg` | `/etc/haproxy/haproxy-tproxy.cfg` | **模式 B** 配置：三层 `TPROXY` + 二层网桥 `REDIRECT` 双引擎全端口透明 TCP 截断重建，内置 `dst_is_local` 防自环保护与按需注入的 `ALLOW`/`DENY` 过滤槽位 |
 | `run.sh` | `/run.sh` | 容器统一入口脚本（模板还原、配置渲染、规则挂载、就绪探测与信号自愈清理） |
 | `buildx.sh` | *(构建宿主机执行)* | 多架构（`amd64` + `arm64`）镜像构建与 Manifest 推送脚本 |
 | `commit.sh` | *(构建期容器内执行)* | 容器环境初始化、配置写入与构建期语法自检脚本 |
@@ -25,7 +25,7 @@
 ## 第一部分：运行工作流详解
 
 ### 0. 公共启动预处理（`run.sh`）
-1. **目录与模板还原**：创建 `/var/run` 与配置目录（默认 `/etc/haproxy`）。首次启动将 `dnsmasq.conf`、`haproxy.cfg`、`haproxy-tproxy.cfg` 备份为 `.tpl` 原始模板；后续每次 `docker restart` 均从 `.tpl` 重新覆盖还原，杜绝重复追加污染。
+1. **目录与模板还原**：创建 `/var/run` 与配置目录（默认 `/etc/haproxy`）。首次启动将 `dnsmasq.conf`、`haproxy.cfg`、`haproxy-tproxy.cfg`、`haproxy.map` 备份为 `.tpl` 原始模板；后续每次 `docker restart` 均从 `.tpl` 重新覆盖还原（手动维护且无自动生成头的 `haproxy.map` 原样保留），杜绝重复追加或残留污染。
 2. **时区同步**：若传入有效 `TZ` 变量，同步覆盖 `/etc/localtime`（镜像构建期默认 `Asia/Shanghai`）。
 3. **运行模式判定**：读取 `TPROXY`（去空白并转小写）：
    - 为空、`0`、`false`、`off`、`no` → 进入 **模式 A**；
@@ -75,11 +75,11 @@ flowchart TD
 ### 2. 模式 B 工作流：三层 `TPROXY` + 二层网桥 `REDIRECT` 双引擎透明截断
 
 #### 2.1 启动与退出自愈流程
-1. **双端口分配与配置渲染**：解析 `TPROXY` 参数；选定三层 `TPROXY` 监听端口 `tproxy_port`，开启自动拦截时额外分配互不冲突的二层 `REDIRECT` 端口 `redir_port`（均从 `10000..29999` 排除当前 `/proc/net/tcp` 与 `tcp6` 已占端口随机挑选），渲染 `haproxy-tproxy.cfg` 并执行 `haproxy -c` 校验。
+1. **双端口分配与配置渲染**：解析 `TPROXY` 参数；选定三层 `TPROXY` 监听端口 `tproxy_port`，开启自动拦截时额外分配互不冲突的二层 `REDIRECT` 端口 `redir_port`（均从 `10000..29999` 排除当前 `/proc/net/tcp` 与 `tcp6` 已占端口随机挑选）；若设置了 `ALLOW` 或 `DENY`（两者同时非空时以 `ALLOW` 为准并清空 `DENY`），自动展开 `域名:端口` 写入 `haproxy.map` 并按需向 `haproxy-tproxy.cfg` 注入表内端口过滤规则（未设置时保持 0 嗅探纯四层直通），最后执行 `haproxy -c` 校验。
 2. **先监听、后挂流**：后台拉起 HAProxy 并注册 `TERM/INT/QUIT/USR1` 信号钩子；轮询 `/proc/net/tcp` 确认 `tproxy_port` 与 `redir_port` 均进入 `0A (LISTEN)` 状态后，再执行 `setup_tproxy` 挂载策略路由与三表规则，实现 0 毫秒断流切换。
 3. **停止与异常退出自愈**：收到停止信号或 HAProxy 进程意外退出时，自动执行 `cleanup_tproxy`，同时清扫 `iptables` 与 `iptables-legacy` 的 `mangle`/`nat`/`filter` 三表 `HAPROXY_*` 子链及 `pref 200/201`、`table 108` 策略路由，瞬间恢复宿主机原网络状态。
 
-#### 2.2 双引擎数据面流转（不改动 `bridge-nf-call-iptables`）
+#### 2.2 双引擎数据面流转（不改动 `bridge-nf-call-iptables`，不触碰 UDP）
 ```mermaid
 flowchart TD
     InPkt["过境新建公网 TCP 连接 (SYN)"] --> Layer{"入口网络层类型"}
@@ -92,10 +92,17 @@ flowchart TD
     NatPre --> DoRedir["排除无 IP 纯二层桥 / LOCAL / 保留私网段, 执行 -j REDIRECT 转至网桥网关IP:redir_port"]
     DoRedir --> InputFilter["filter INPUT (HAPROXY_IN_*): 仅放行 --ctstate DNAT 重定向包 (直连扫描直接 DROP), 送入 0.0.0.0:redir_port (SO_ORIGINAL_DST 取原目标)"]
 
-    PolicyRt --> SplitTCP["HAProxy 四层截断重建 (splice 内核态零拷贝)"]
-    InputFilter --> SplitTCP
+    PolicyRt --> OptFlt{"是否配置 ALLOW 或 DENY ?"}
+    InputFilter --> OptFlt
 
-    SplitTCP --> BackendOut["后端 tcp_tproxy_out 发起第二段连接: 默认 usesrc clientip 保留原客户端/容器 IP + 打标 0x89 -> CONNMARK 0x88, 自动继承宿主机策略路由与 NAT 并钳制隧道 MSS"]
+    OptFlt -- "未配置 (默认)" --> SplitTCP["HAProxy 纯四层截断重建 (0 嗅探, splice 内核态零拷贝)"]
+    OptFlt -- "已配置" --> PortChk{"目标端口在表内端口集合中?"}
+    PortChk -- "否 (表外端口)" --> UnlistedAct["DENY 或默认 ALLOW: 0ms 直接放行 / +ALLOW 模式: 0ms 直接断连"]
+    PortChk -- "是 (表内端口)" --> DomainChk["纯 IP 与无域名协议直接放行; TLS 取 SNI:端口 / HTTP与WS 取 Host:端口 查 haproxy.map (DENY 命中断连, ALLOW 未命中断连)"]
+    UnlistedAct -- "放行" --> SplitTCP
+    DomainChk -- "放行" --> SplitTCP
+
+    SplitTCP --> BackendOut["后端 tcp_tproxy_out / http_tproxy_out 发起第二段连接: 默认 usesrc clientip 保留原源 IP + 打标 0x89 -> CONNMARK 0x88, 继承宿主机路由与 NAT 并钳制隧道 MSS"]
     BackendOut --> ReplyDiv["远端回包命中 mangle PREROUTING 顶端 --ctdir REPLY --connmark 0x88 -> HAPROXY_DIV_* 打标 0x88 送回 HAProxy"]
 ```
 
@@ -118,7 +125,7 @@ flowchart TD
 
 | 变量名 | 默认值 | 取值格式与规则说明 |
 | :--- | :--- | :--- |
-| **`TABLE`** | *(空)* | **核心路由映射规则**，多条规则用 `;` 分隔，单条格式：**`源域名[,转发目标[,可选标记]]`**<br>**① 第 1 列 `源域名`**（严禁含 `:`）：<br>• `abc.com`：同时匹配根域 `abc.com` 与所有子域 `*.abc.com`<br>• `^abc.com`（或 `@abc.com`）：仅精确匹配单域名 `abc.com`<br>• `*.abc.com`：仅匹配泛子域名，不含根域 `abc.com`<br>**② 第 2 列 `转发目标`** *(可选)*：<br>• 留空或 `*`：解锁模式，按客户端请求的原域名动态解析 IPv4 转发<br>• `<端口>`（如 `50443`）：解析原请求域名，转发至该指定端口（`*:<端口>`）<br>• `<IPv4或域名或同网桥容器名>`（如 `172.17.0.3` 或 `ocserv`）：自动补默认端口（`http` 补 `:80`，其余补 `:443`）<br>• `<主机>:<端口>`（如 `172.17.0.3:50443` 或 `ocserv:50443`）：转发至指定地址与端口<br>*(注：凡带自定义转发目标的域名，会自动加入 Dnsmasq 直通上游真实解析，不被劫持为本机 IP)*<br>**③ 第 3 列 `可选标记`** *(可选，大小写不敏感)*：<br>• 留空：标准四层 TLS / 七层 HTTP 透传<br>• `proxy`（别名 `proxy_protocol` / `proxy-v2` / `proxy_v2`）：向后端发送 **PROXY Protocol v2** 头（80 端口及 443 明文 HTTP 访问直接 0 字节断连；兼容第 2 列末尾空格旧写法如 `50443 proxy`）<br>• `proxy-v1`（别名 `proxy_v1`）：向后端发送 **PROXY Protocol v1** 文本头<br>• `http`：声明纯明文 HTTP 后端（仅响应 80 端口且不跳 HTTPS，443 访问直接断连） |
+| **`TABLE`** | *(空)* | **核心路由映射规则**，多条规则用 `;` 分隔，单条格式：**`源域名[,转发目标[,可选标记]]`**<br>**① 第 1 列 `源域名`**（严禁含 `:`）：<br>• `abc.com`：同时匹配根域 `abc.com` 与所有子域 `*.abc.com`<br>• `^abc.com`（或 `@abc.com`）：仅精确匹配单域名 `abc.com`<br>• `*.abc.com`：仅匹配泛子域名，不含根域 `abc.com`<br>**② 第 2 列 `转发目标`** *(可选)*：<br>• 留空或 `*`：解锁模式，按客户端请求的原域名动态解析 IPv4 转发<br>• `<端口>` 或 `:<端口>`（如 `50443` 或 `:50443`）：解析原请求域名，转发至该指定端口（`*:<端口>`）<br>• `<IPv4或域名或同网桥容器名>`（如 `172.17.0.3` 或 `ocserv`）：自动补默认端口（`http` 补 `:80`，其余补 `:443`）<br>• `<主机>:<端口>`（如 `172.17.0.3:50443` 或 `ocserv:50443`）：转发至指定地址与端口<br>*(注：凡带自定义转发目标的域名，会自动加入 Dnsmasq 直通上游真实解析，不被劫持为本机 IP)*<br>**③ 第 3 列 `可选标记`** *(可选，大小写不敏感)*：<br>• 留空：标准四层 TLS / 七层 HTTP 透传<br>• `proxy`（别名 `proxy_protocol` / `proxy-v2` / `proxy_v2`）：向后端发送 **PROXY Protocol v2** 头（80 端口及 443 明文 HTTP 访问直接 0 字节断连；兼容第 2 列末尾空格旧写法如 `50443 proxy`）<br>• `proxy-v1`（别名 `proxy_v1`）：向后端发送 **PROXY Protocol v1** 文本头<br>• `http`：声明纯明文 HTTP 后端（仅响应 80 端口且不跳 HTTPS，443 访问直接断连） |
 | **`PORT`** | `3535` | Dnsmasq 对外劫持 DNS 监听的 UDP 端口：<br>• `1` ~ `65535`：启动 Dnsmasq 监听该端口<br>• `0` / `off` / `false` / `no` / `none`：**禁用 Dnsmasq**，仅运行纯 HAProxy 80/443 分流 |
 | **`ADDR`** | *(自动探测)* | Dnsmasq 劫持应答的本机公网 IPv4（同时作为 HAProxy 80/443 防自环校验地址）。留空时自动通过公网 API 探测，超时则回退取 `DEVICE` 网卡 IPv4 |
 | **`DEVICE`** | *(自动探测)* | Dnsmasq 绑定的网卡名。留空时优先取默认路由网卡，兜底首个非 `lo` 网卡（容器内通常为 `eth0`） |
@@ -147,7 +154,23 @@ flowchart TD
 | 第 1 列 | **`SOURCE`** | `client` | • 留空 / `auto` / `client` / `clientip`：透明绑定原客户端源 IP（`usesrc clientip`）<br>• `local` / `*` / `0.0.0.0`：改用宿主机自身出口 IP 发起后段连接<br>• `<IPv4>`（如 `10.255.22.1`）：强制绑定指定源 IPv4 地址 |
 | 第 2 列 | **`[BIND:]PORT`** | `127.0.0.1:auto` | 三层 `TPROXY` 监听地址与端口：<br>• `BIND`：省略或留空为 `127.0.0.1`；填 `*` 为 `0.0.0.0`；或填具体本机 IPv4<br>• `PORT`：省略 / `0` / `auto` 自动从 `10000~29999` 挑选空闲端口；或填 `1~65535`（开启自动拦截时，二层 `REDIRECT` 端口始终另行自动分配空闲端口并在 `INPUT` 封堵非重定向直连） |
 | 第 3 列 | **`INPUT`** | `auto` | • 留空 / `auto` / `all` / `1` / `true`：自动挂载 `! -i <默认公网口>`<br>• `off` / `none` / `0` / `manual` / `false`：关闭自动 `iptables` 与策略路由，仅前台运行 HAProxy<br>• `<入口列表>`：用 `;` 分隔的网卡名（如 `ipip`、`vpns+`）、网桥名（如 `docker0`）或源 IPv4/CIDR（如 `192.168.144.0/24`） |
-| 第 4 列 | **`FWMARK`** | *(自动)* | • 留空 / `0` / `0x0`：当 `SOURCE` 非 `local` 时自动使用内部 `0x89` 做回包追踪<br>• 十进制（如 `100`）或十六进制（如 `0x64`）：设置后端出站包 `fwmark`；若宿主机存在同号路由表（`table 100`），自动添加 `ip rule pref 201 fwmark <值> lookup <值>` |
+| 第 4 列 | **`FWMARK`** | *(自动)* | • 留空 / `auto` / `off` / `none` / `false` / `0` / `0x0`：当 `SOURCE` 非 `local` 时自动使用内部 `0x89` 做回包追踪<br>• 十进制（如 `100`）或十六进制（如 `0x64`）：设置后端出站包 `fwmark`；若宿主机存在同号路由表（`table 100`），自动添加 `ip rule pref 201 fwmark <值> lookup <值>` |
+
+#### 3.3 可选域名:端口过滤环境变量（`ALLOW` / `DENY`，仅模式 B 生效）
+
+- **互斥与默认行为**：`ALLOW`（白名单）与 `DENY`（黑名单）互斥；**若两个变量同时有值，优先使用 `ALLOW` 并将 `DENY` 置空**。两者均留空时不注入任何过滤规则，保持 100% 零损耗纯四层盲转。全程不触碰 UDP。
+- **条目与端口展开规则**（多条规则用 `;` 分隔，统一按真实 TCP 目标端口与小写去尾点域名匹配，不绑定协议）：
+  - `abc.com`（未指定端口）：自动展开为 `abc.com:80` 与 `abc.com:443`（同时含根域与泛子域）
+  - `abc.com:8080`（显式指定 `1~65535` 端口）：匹配该域名（根域与泛子域）的 `8080` 端口
+  - `*.abc.com` / `*.abc.com:8080`：仅匹配泛子域名（不含根域 `abc.com`）
+  - `^abc.com` / `^abc.com:8080`（或 `@` 前缀）：仅精确匹配单域名本身
+  - **`+` 严格端口修饰符（仅 `ALLOW` 有效）**：当首个域名字段以 `+` 开头（如 `ALLOW="+abc.com;xyz.com:8080"`、`ALLOW="+*.abc.com"`、`ALLOW="+^abc.com:8443"`）时，开启**表外端口拦截**；默认不带 `+` 为**表外端口放行**。
+
+| 变量 / 模式 | 表外端口流量 *(不做嗅探)* | 表内端口 · 命中 `域名:端口` | 表内端口 · 未命中其它域名 | 表内端口 · 纯 IP / 无域名协议 |
+| :--- | :---: | :---: | :---: | :---: |
+| **`DENY="abc.com;x.com:8080"`** | **`0ms` 直接放行** | **0 字节断连拦截** | **放行** | **放行** |
+| **`ALLOW="abc.com;x.com:8080"`** *(默认)* | **`0ms` 直接放行** | **放行** | **0 字节断连拦截** | **放行** |
+| **`ALLOW="+abc.com;x.com:8080"`** *(带 `+`)* | **`0ms` 直接断连拦截** | **放行** | **0 字节断连拦截** | **放行** |
 
 ---
 
@@ -173,7 +196,7 @@ docker run --restart always --name sniproxy \
   -dt ocserv/haproxy
 ```
 
-### 2. 模式 B 启动示例（透明四层 TCP 截断加速）
+### 2. 模式 B 启动示例（透明四层 TCP 截断加速 + 可选域名过滤）
 ```bash
 # 场景 1：零配置接管本机全部三层隧道与二层网桥容器过境公网 TCP
 docker run --restart always --name haproxy-tproxy \
@@ -181,13 +204,21 @@ docker run --restart always --name haproxy-tproxy \
   -e "TPROXY=1" \
   -dt ocserv/haproxy
 
-# 场景 2：精准接管指定隧道口与指定容器网段（多路用 ; 分隔）
+# 场景 2：精准接管指定隧道口与容器网段，并开启 DENY 域名黑名单（拦截指定域名 80/443 及自定义端口）
 docker run --restart always --name haproxy-tproxy \
   --network host --privileged \
   -e "TPROXY=ipip;192.168.144.0/24" \
+  -e "DENY=ads.example.com; *.tracker.net; panel.bad.org:8080" \
   -dt ocserv/haproxy
 
-# 场景 3：应急一键清理（若曾用 docker rm -f / kill -9 强杀容器且不再启动代理时）
+# 场景 3：开启 ALLOW 白名单（默认表外端口放行；若首项冠以 + 如 +openai.com 则表外端口一并拦截）
+docker run --restart always --name haproxy-tproxy \
+  --network host --privileged \
+  -e "TPROXY=1" \
+  -e "ALLOW=openai.com; claude.ai; api.internal.org:8443" \
+  -dt ocserv/haproxy
+
+# 场景 4：应急一键清理（若曾用 docker rm -f / kill -9 强杀容器且不再启动代理时）
 docker run --rm --network host --privileged -e "TPROXY=clean" ocserv/haproxy
 ```
 
